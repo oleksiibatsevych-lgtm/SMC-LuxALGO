@@ -8,7 +8,6 @@ import io
 import pickle
 import numpy as np
 import pandas as pd
-import pandas_ta as ta
 import yfinance as yf
 import matplotlib
 matplotlib.use('Agg')
@@ -42,6 +41,32 @@ PAIR_MAPPING = {
     "USD/CHF": "USDCHF=X", "EUR/GBP": "EURGBP=X", "USD/JPY": "USDJPY=X", 
     "AUD/JPY": "AUDJPY=X", "EUR/JPY": "EURJPY=X", "GBP/CAD": "GBPCAD=X"
 }
+
+def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    # ATR (Average True Range)
+    high_low = df['High'] - df['Low']
+    high_close = np.abs(df['High'] - df['Close'].shift())
+    low_close = np.abs(df['Low'] - df['Close'].shift())
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    df['ATR'] = tr.ewm(com=13, adjust=False).mean()
+
+    # RSI
+    delta = df['Close'].diff()
+    gain = delta.clip(lower=0)
+    loss = -1 * delta.clip(upper=0)
+    ema_gain = gain.ewm(com=13, adjust=False).mean()
+    ema_loss = loss.ewm(com=13, adjust=False).mean()
+    rs = ema_gain / ema_loss
+    df['RSI'] = 100 - (100 / (1 + rs))
+
+    # MACD
+    ema12 = df['Close'].ewm(span=12, adjust=False).mean()
+    ema26 = df['Close'].ewm(span=26, adjust=False).mean()
+    df['MACD'] = ema12 - ema26
+    df['MACDs'] = df['MACD'].ewm(span=9, adjust=False).mean()
+    df['MACDh_12_26_9'] = df['MACD'] - df['MACDs']
+
+    return df
 
 async def init_db():
     conn = await asyncpg.connect(DATABASE_URL)
@@ -124,6 +149,7 @@ async def cached_yf_download(ticker: str, period: str, interval: str) -> pd.Data
         if not df.empty:
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
+            df = calculate_indicators(df)
             await set_cached_data_db(key, df)
         return df
     except Exception as e:
@@ -227,20 +253,18 @@ async def analyze_market(pair: str) -> dict:
         )
         if df_1m.empty or df_1h.empty or len(df_1m) < 30 or len(df_1h) < 10:
             return {"status": False, "reason": "Недостатньо даних котирувань"}
-        df_1m['ATR'] = ta.atr(df_1m['High'], df_1m['Low'], df_1m['Close'], length=14)
-        df_1m['RSI'] = ta.rsi(df_1m['Close'], length=14)
-        macd = ta.macd(df_1m['Close'])
-        df_1m = pd.concat([df_1m, macd], axis=1)
-        bbands = ta.bbands(df_1m['Close'], length=20)
-        df_1m = pd.concat([df_1m, bbands], axis=1)
+        
         current_atr = df_1m['ATR'].iloc[-1]
         current_rsi = df_1m['RSI'].iloc[-1]
         avg_price = df_1m['Close'].iloc[-1]
+        
         if pd.isna(current_atr) or (current_atr / avg_price) < 0.00012:
             return {"status": False, "reason": "Ринок у стані флету (низький ATR)"}
-        df_1h['EMA20'] = ta.ema(df_1h['Close'], length=20)
-        df_1h['EMA50'] = ta.ema(df_1h['Close'], length=50)
+        
+        df_1h['EMA20'] = df_1h['Close'].ewm(span=20, adjust=False).mean()
+        df_1h['EMA50'] = df_1h['Close'].ewm(span=50, adjust=False).mean()
         trend_1h_bullish = df_1h['EMA20'].iloc[-1] > df_1h['EMA50'].iloc[-1]
+        
         atr_ratio = current_atr / avg_price
         if atr_ratio > 0.0008:
             expiry_minutes = 1
@@ -248,6 +272,7 @@ async def analyze_market(pair: str) -> dict:
             expiry_minutes = 5
         else:
             expiry_minutes = 15
+            
         recent_data = df_1m.tail(1000)
         min_p, max_p = recent_data['Close'].min(), recent_data['Close'].max()
         bins = np.linspace(min_p, max_p, 30)
@@ -255,16 +280,20 @@ async def analyze_market(pair: str) -> dict:
         vol_profile = recent_data.groupby(hist, observed=False)['Volume'].sum()
         poc_bin = vol_profile.idxmax()
         poc_price = (poc_bin.left + poc_bin.right) / 2
+        
         df_1m['BodyMax'] = df_1m[['Open', 'Close']].max(axis=1)
         df_1m['BodyMin'] = df_1m[['Open', 'Close']].min(axis=1)
         body_high_rolling = df_1m['BodyMax'].rolling(window=10).max()
         body_low_rolling = df_1m['BodyMin'].rolling(window=10).min()
         current_close = df_1m['Close'].iloc[-1]
+        
         bullish_bos = current_close > body_high_rolling.iloc[-3]
         bearish_bos = current_close < body_low_rolling.iloc[-3]
         ob_status = "Bullish BOS" if bullish_bos else ("Bearish BOS" if bearish_bos else "Флет структура")
         fvg_status = "Немає FVG"
+        
         macd_hist = df_1m.iloc[-1].get('MACDh_12_26_9', 0)
+        
         if trend_1h_bullish and (bullish_bos or macd_hist > 0) and current_rsi < 70:
             direction = "🟢 CALL (Вгору)"
             confidence = random.randint(90, 98)
@@ -279,6 +308,7 @@ async def analyze_market(pair: str) -> dict:
             confidence = random.randint(80, 89)
         else:
             return {"status": False, "reason": "Суперечливі дані індикаторів"}
+            
         await update_statistics(pair, direction, confidence)
         return {
             "status": True, "pair": pair, "direction": direction, "confidence": confidence,
