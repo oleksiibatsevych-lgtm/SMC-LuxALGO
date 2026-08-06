@@ -1,9 +1,9 @@
 python-telegram-bot
-pandas
 numpy
-pandas-ta
+pandas
 yfinance
 matplotlib
 asyncpg
 apscheduler
 tenacity
+git+https://github.com/twopirllc/pandas-ta.git
