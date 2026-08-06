@@ -6,4 +6,3 @@ matplotlib
 asyncpg
 apscheduler
 tenacity
-git+https://github.com/twopirllc/pandas-ta.git
