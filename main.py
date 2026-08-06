@@ -316,8 +316,9 @@ async def analyze_market(pair: str) -> dict:
 
         score = 50  
         
-        bullish_weights = sum(1 for t in [trend_1d, trend_4h, trend_1h, trend_15m] if t == "Bullish")
-        bearish_weights = sum(1 for t in [trend_1d, trend_4h, trend_1h, trend_15m] if t == "Bearish")
+        # ВИПРАВЛЕНО: замінено квадратною дужкою на круглу у генераторах
+        bullish_weights = sum(1 for t in (trend_1d, trend_4h, trend_1h, trend_15m) if t == "Bullish")
+        bearish_weights = sum(1 for t in (trend_1d, trend_4h, trend_1h, trend_15m) if t == "Bearish")
 
         if bullish_weights > bearish_weights:
             direction = "🟢 CALL (Вгору)"
