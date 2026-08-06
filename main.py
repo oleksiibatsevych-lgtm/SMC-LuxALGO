@@ -1,6 +1,5 @@
 import os
 import time
-import random
 import logging
 import asyncpg
 import asyncio
@@ -12,6 +11,7 @@ import yfinance as yf
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from datetime import datetime, timezone
 
 from tenacity import retry, stop_after_attempt, wait_fixed
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -67,20 +67,34 @@ def calc_macd(series, fast=12, slow=26, signal=9):
     return pd.DataFrame({
         'MACD': macd_line,
         'MACDs': signal_line,
-        'MACDh_12_26_9': macd_hist
-    })
-
-def calc_bbands(series, length=20, std=2):
-    sma = series.rolling(window=length).mean()
-    r_std = series.rolling(window=length).std()
-    return pd.DataFrame({
-        'BBL': sma - (r_std * std),
-        'BBM': sma,
-        'BBU': sma + (r_std * std)
+        'MACDh': macd_hist
     })
 
 def calc_ema(series, length):
     return series.ewm(span=length, adjust=False).mean()
+
+def detect_fvg(df):
+    if len(df) < 3:
+        return "None"
+    # Bullish Fvg: Low of current > High of 2 candles ago
+    if df['Low'].iloc[-1] > df['High'].iloc[-3]:
+        return "Bullish FVG"
+    # Bearish Fvg: High of current < Low of 2 candles ago
+    elif df['High'].iloc[-1] < df['Low'].iloc[-3]:
+        return "Bearish FVG"
+    return "None"
+
+def detect_order_block(df):
+    if len(df) < 5:
+        return "None"
+    # Simple OB logic: Strong impulsive candle preceded by opposite color candle
+    last_body = df['Close'].iloc[-2] - df['Open'].iloc[-2]
+    prev_body = df['Close'].iloc[-3] - df['Open'].iloc[-3]
+    if last_body > 0 and prev_body < 0:
+        return "Bullish OB"
+    elif last_body < 0 and prev_body > 0:
+        return "Bearish OB"
+    return "None"
 
 async def init_db():
     conn = await asyncpg.connect(DATABASE_URL)
@@ -166,7 +180,7 @@ async def cached_yf_download(ticker: str, period: str, interval: str) -> pd.Data
             await set_cached_data_db(key, df)
         return df
     except Exception as e:
-        logging.error(f"Помилка завантаження Yahoo Finance для {ticker}: {e}")
+        logging.error(f"Помилка завантаження Yahoo Finance для {ticker} ({interval}): {e}")
         return pd.DataFrame()
 
 async def update_statistics(pair: str, direction: str, confidence: int):
@@ -244,7 +258,7 @@ def generate_market_chart(df_1m: pd.DataFrame, pair: str, direction: str, entry_
     ax.plot(recent.index, recent['Close'], label='Close Price', color='#1f77b4', linewidth=1.5)
     ax.axhline(y=entry_price, color='#ff7f0e', linestyle='--', label=f'Entry: {entry_price:.5f}')
     ax.axhline(y=poc_price, color='#2ca02c', linestyle=':', label=f'POC: {poc_price:.5f}')
-    ax.set_title(f"LuxAlgo SMC Analysis: {pair} ({direction})", fontsize=12, fontweight='bold')
+    ax.set_title(f"Multi-TF SMC Analysis: {pair} ({direction})", fontsize=12, fontweight='bold')
     ax.set_xlabel("Time (1m)", fontsize=10)
     ax.set_ylabel("Price", fontsize=10)
     ax.legend(loc='upper left')
@@ -260,39 +274,88 @@ def generate_market_chart(df_1m: pd.DataFrame, pair: str, direction: str, entry_
 async def analyze_market(pair: str) -> dict:
     ticker_symbol = PAIR_MAPPING.get(pair)
     try:
-        df_1m, df_1h = await asyncio.gather(
+        # Завантаження всіх таймфреймів паралельно
+        df_1m, df_5m, df_15m, df_30m, df_1h, df_4h, df_1d = await asyncio.gather(
             cached_yf_download(ticker_symbol, period="1d", interval="1m"),
-            cached_yf_download(ticker_symbol, period="5d", interval="1h")
-        )
-        if df_1m.empty or df_1h.empty or len(df_1m) < 30 or len(df_1h) < 10:
-            return {"status": False, "reason": "Недостатньо даних котирувань"}
+            cached_yf_download(ticker_symbol, period="5d", interval="5m"),
+            cached_yf_download(ticker_symbol, period="10d", interval="15m"),
+            cached_yf_download(ticker_symbol, period="20d", interval="30m"),
+            cached_yf_download(ticker_symbol, period="30d", interval="1h"),
+            cached_yf_download(ticker_symbol, period="60d", interval="4h"),
+            cached_yf_download(ticker_symbol, period="1y", interval="1d")
+        ]
         
+        if df_1m.empty or df_1h.empty or df_1d.empty or len(df_1m) < 30:
+            return {"status": False, "reason": "Недостатньо даних котирувань мульти-ТФ"}
+        
+        # Перевірка торгової сесії (бажано уникати мертвих годин, хоча для форексу 24/5)
+        current_hour = datetime.now(timezone.utc).hour
+        if current_hour in [21, 22, 23]: # Кінець дня / нічний роловер
+            return {"status": False, "reason": "Нічний роловер ринку (низька ліквідність)"}
+
+        # Розрахунок індикаторів
         df_1m['ATR'] = calc_atr(df_1m, length=14)
         df_1m['RSI'] = calc_rsi(df_1m['Close'], length=14)
-        macd = calc_macd(df_1m['Close'])
-        df_1m = pd.concat([df_1m, macd], axis=1)
-        bbands = calc_bbands(df_1m['Close'], length=20)
-        df_1m = pd.concat([df_1m, bbands], axis=1)
+        df_1m = pd.concat([df_1m, calc_macd(df_1m['Close'])], axis=1)
+        df_1m = pd.concat([df_1m, calc_ema(df_1m['Close'], 20)], axis=1) # генерує серію чи df
         
         current_atr = df_1m['ATR'].iloc[-1]
         current_rsi = df_1m['RSI'].iloc[-1]
         avg_price = df_1m['Close'].iloc[-1]
         
-        if pd.isna(current_atr) or (current_atr / avg_price) < 0.00012:
+        if pd.isna(current_atr) or (current_atr / avg_price) < 0.00010:
             return {"status": False, "reason": "Ринок у стані флету (низький ATR)"}
             
-        df_1h['EMA20'] = calc_ema(df_1h['Close'], length=20)
-        df_1h['EMA50'] = calc_ema(df_1h['Close'], length=50)
-        trend_1h_bullish = df_1h['EMA20'].iloc[-1] > df_1h['EMA50'].iloc[-1]
+        # Тренди по старших таймфреймах через EMA 20 та 50
+        def get_trend(df):
+            if len(df) < 50: return "Neutral"
+            e20 = calc_ema(df['Close'], 20).iloc[-1]
+            e50 = calc_ema(df['Close'], 50).iloc[-1]
+            return "Bullish" if e20 > e50 else "Bearish"
+
+        trend_1d = get_trend(df_1d)
+        trend_4h = get_trend(df_4h)
+        trend_1h = get_trend(df_1h)
+        trend_15m = get_trend(df_15m)
+
+        # SMC паттерни
+        fvg_val = detect_fvg(df_5m)
+        ob_val = detect_order_block(df_5m)
+
+        # Математичний розрахунок балів (Score System)
+        score = 50  # Базова точка
         
+        # Визначення напрямку на основі гармонії старших ТФ
+        bullish_weights = sum([1 for t in [trend_1d, trend_4h, trend_1h, trend_15m] if t == "Bullish"])
+        bearish_weights = sum([1 for t in [trend_1d, trend_4h, trend_1h, trend_15m] if t == "Bearish"])
+
+        if bullish_weights > bearish_weights:
+            direction = "🟢 CALL (Вгору)"
+            score += bullish_weights * 8
+            if "Bullish" in fvg_val: score += 12
+            if "Bullish" in ob_val: score += 10
+            if current_rsi < 65: score += 10
+        else:
+            direction = "🔴 PUT (Вниз)"
+            score += bearish_weights * 8
+            if "Bearish" in fvg_val: score += 12
+            if "Bearish" in ob_val: score += 10
+            if current_rsi > 35: score += 10
+
+        confidence = int(min(98, max(65, score)))
+        if confidence < 75:
+            return {"status": False, "reason": f"Низька загальна сумісність індикаторів (Score: {score})"}
+
+        # Динамічна експірація через ATR
         atr_ratio = current_atr / avg_price
         if atr_ratio > 0.0008:
-            expiry_minutes = 1
+            expiry_minutes = 3
         elif atr_ratio > 0.0004:
             expiry_minutes = 5
         else:
             expiry_minutes = 15
             
+        # Volume Profile POC
         recent_data = df_1m.tail(1000)
         min_p, max_p = recent_data['Close'].min(), recent_data['Close'].max()
         bins = np.linspace(min_p, max_p, 30)
@@ -301,43 +364,17 @@ async def analyze_market(pair: str) -> dict:
         poc_bin = vol_profile.idxmax()
         poc_price = (poc_bin.left + poc_bin.right) / 2
         
-        df_1m['BodyMax'] = df_1m[['Open', 'Close']].max(axis=1)
-        df_1m['BodyMin'] = df_1m[['Open', 'Close']].min(axis=1)
-        body_high_rolling = df_1m['BodyMax'].rolling(window=10).max()
-        body_low_rolling = df_1m['BodyMin'].rolling(window=10).min()
         current_close = df_1m['Close'].iloc[-1]
-        
-        bullish_bos = current_close > body_high_rolling.iloc[-3]
-        bearish_bos = current_close < body_low_rolling.iloc[-3]
-        ob_status = "Bullish BOS" if bullish_bos else ("Bearish BOS" if bearish_bos else "Флет структура")
-        fvg_status = "Немає FVG"
-        
-        macd_hist = df_1m.iloc[-1].get('MACDh_12_26_9', 0)
-        
-        if trend_1h_bullish and (bullish_bos or macd_hist > 0) and current_rsi < 70:
-            direction = "🟢 CALL (Вгору)"
-            confidence = random.randint(90, 98)
-        elif not trend_1h_bullish and (bearish_bos or macd_hist < 0) and current_rsi > 30:
-            direction = "🔴 PUT (Вниз)"
-            confidence = random.randint(90, 98)
-        elif trend_1h_bullish and current_rsi < 75:
-            direction = "🟢 CALL (Вгору)"
-            confidence = random.randint(80, 89)
-        elif current_rsi > 25:
-            direction = "🔴 PUT (Вниз)"
-            confidence = random.randint(80, 89)
-        else:
-            return {"status": False, "reason": "Суперечливі дані індикаторів"}
-            
+
         await update_statistics(pair, direction, confidence)
         return {
             "status": True, "pair": pair, "direction": direction, "confidence": confidence,
             "entry_price": current_close, "expiry": expiry_minutes, "poc": poc_price,
-            "ob": ob_status, "fvg": fvg_status, "rsi": current_rsi, "df": df_1m
+            "ob": ob_val, "fvg": fvg_val, "rsi": current_rsi, "df": df_1m
         }
     except Exception as e:
         logging.error(f"Помилка аналізу для {pair}: {e}")
-        return {"status": False, "reason": "Помилка обчислення"}
+        return {"status": False, "reason": "Помилка обчислення мульти-ТФ"}
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not check_access(update):
@@ -349,7 +386,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard.append([InlineKeyboardButton(pair, callback_data=f"sig_{pair}") for pair in pairs[i:i+2]])
     keyboard.append([InlineKeyboardButton("📊 Аналіз усіх пар", callback_data="signal_all")])
     keyboard.append([InlineKeyboardButton("📈 Статистика", callback_data="show_stats")])
-    await update.message.reply_text("👋 Вітаю! Оберіть валютну пару для швидкого аналізу:", reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text("👋 Вітаю! Мультитаймфреймовий сканер готовий. Оберіть пару:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -390,10 +427,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         caption = (
             f"💱 Пара: <b>{target}</b>\n"
             f"📈 Напрямок: <b>{res['direction']}</b>\n"
-            f"⏳ Експірація (Динамічна): <b>{res['expiry']} хв</b>\n"
-            f"🎯 Ймовірність: <b>{res['confidence']}%</b>\n"
-            f"📊 RSI: <code>{res['rsi']:.1f}</code>\n"
-            f"📍 POC: <code>{res['poc']:.5f}</code>\n"
+            f"⏳ Експірація: <b>{res['expiry']} хв</b>\n"
+            f"🎯 Math Score: <b>{res['confidence']}%</b>\n"
+            f"📦 OB: <code>{res['ob']}</code> | FVG: <code>{res['fvg']}</code>\n"
+            f"📊 RSI: <code>{res['rsi']:.1f}</code> | POC: <code>{res['poc']:.5f}</code>\n"
         )
         keyboard = [
             [InlineKeyboardButton("✅ Win", callback_data=f"win_{target}"), InlineKeyboardButton("❌ Loss", callback_data=f"loss_{target}")],
@@ -405,10 +442,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not check_antiflood(user_id):
             await query.answer(f"⏳ Зачекайте {COOLDOWN_TIME} секунд!", show_alert=True)
             return
-        await query.edit_message_text(text="<b>⏳ Сканування всіх пар...</b>", parse_mode="HTML")
+        await query.edit_message_text(text="<b>⏳ Глибоке мульти-ТФ сканування ринку...</b>", parse_mode="HTML")
         tasks = [analyze_market(p) for p in PAIR_MAPPING.keys()]
         results = await asyncio.gather(*tasks)
-        res_text = "<b>📊 Звіт сканування ринку:</b>\n\n"
+        res_text = "<b>📊 Звіт мультитаймфрейм сканування:</b>\n\n"
         for r in results:
             if r["status"]:
                 res_text += f"💱 <b>{r['pair']}</b> | {r['direction']} | {r['confidence']}%\n"
@@ -432,8 +469,8 @@ def background_market_scanner_sync(bot):
         for pair in PAIR_MAPPING.keys():
             try:
                 res = await analyze_market(pair)
-                if res["status"] and res["confidence"] >= 90:
-                    text = f"🔥 <b>АВТО-СИГНАЛ (>90%)</b>\n💱 {pair}\n{res['direction']} | Ймовірність: {res['confidence']}%"
+                if res["status"] and res["confidence"] >= 88:
+                    text = f"🔥 <b>МУЛЬТИ-ТФ АВТО-СИГНАЛ</b>\n💱 {pair}\n{res['direction']} | Score: {res['confidence']}%"
                     await bot.send_message(chat_id=NOTIFICATION_CHAT_ID, text=text, parse_mode="HTML")
             except Exception as e:
                 logging.error(f"Помилка у фоновому сканері для {pair}: {e}")
@@ -459,7 +496,7 @@ def background_trade_checker_sync(bot):
                     is_win = (current_price > entry_price) if is_call else (current_price < entry_price)
                     await update_outcome(pair, is_win)
                     try:
-                        result_text = f"🤖 <b>Авто-результат угоди ({pair}):</b> {'ПЛЮС ✅' if is_win else 'МІНУС ❌'}\nВхід: {entry_price:.5f} | Закінчення: {current_price:.5f}"
+                        result_text = f"🤖 <b>Результат угоди ({pair}):</b> {'ПЛЮС ✅' if is_win else 'МІНУС ❌'}\nВхід: {entry_price:.5f} | Завершення: {current_price:.5f}"
                         await bot.send_message(chat_id=chat_id, text=result_text, parse_mode="HTML")
                     except Exception as e:
                         logging.error(f"Не вдалося надіслати результат у чат {chat_id}: {e}")
