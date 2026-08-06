@@ -58,6 +58,33 @@ def calc_atr(df, length=14):
     true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     return true_range.rolling(window=length).mean()
 
+def calc_adx(df, period=14):
+    if len(df) < period * 2:
+        return pd.Series(25, index=df.index)
+    alpha = 1 / period
+    plus_dm = df['High'].diff()
+    minus_dm = df['Low'].diff()
+    plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0.0)
+    minus_dm = np.where((minus_dm > plus_dm) & (minus_dm > 0), minus_dm, 0.0)
+    
+    tr = calc_atr(df, period)
+    tr = tr.replace(0, np.nan).fillna(1e-9)
+    plus_di = 100 * pd.Series(plus_dm, index=df.index).ewm(alpha=alpha, adjust=False).mean() / tr
+    minus_di = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=alpha, adjust=False).mean() / tr
+    
+    sum_di = plus_di + minus_di
+    sum_di = sum_di.replace(0, np.nan).fillna(1e-9)
+    dx = 100 * np.abs(plus_di - minus_di) / sum_di
+    adx = dx.ewm(alpha=alpha, adjust=False).mean()
+    return adx
+
+def check_volume_spike(df):
+    if len(df) < 20:
+        return False
+    avg_vol = df['Volume'].iloc[-20:-1].mean()
+    last_vol = df['Volume'].iloc[-1]
+    return last_vol > (avg_vol * 1.5)
+
 def calc_macd(series, fast=12, slow=26, signal=9):
     ema_fast = series.ewm(span=fast, adjust=False).mean()
     ema_slow = series.ewm(span=slow, adjust=False).mean()
@@ -271,13 +298,11 @@ def generate_market_chart(df_1m: pd.DataFrame, pair: str, direction: str, entry_
 async def analyze_market(pair: str) -> dict:
     ticker_symbol = PAIR_MAPPING.get(pair)
     try:
-        df_1m, df_5m, df_15m, df_30m, df_1h, df_4h, df_1d = await asyncio.gather(
+        # Оптимізовані 4 таймфрейми для захисту від блокування Yahoo Finance
+        df_1m, df_5m, df_1h, df_1d = await asyncio.gather(
             cached_yf_download(ticker_symbol, period="1d", interval="1m"),
             cached_yf_download(ticker_symbol, period="5d", interval="5m"),
-            cached_yf_download(ticker_symbol, period="10d", interval="15m"),
-            cached_yf_download(ticker_symbol, period="20d", interval="30m"),
             cached_yf_download(ticker_symbol, period="30d", interval="1h"),
-            cached_yf_download(ticker_symbol, period="60d", interval="4h"),
             cached_yf_download(ticker_symbol, period="1y", interval="1d")
         )
         
@@ -290,14 +315,19 @@ async def analyze_market(pair: str) -> dict:
 
         df_1m['ATR'] = calc_atr(df_1m, length=14)
         df_1m['RSI'] = calc_rsi(df_1m['Close'], length=14)
+        df_1m['ADX'] = calc_adx(df_1m, length=14)
         df_1m = pd.concat([df_1m, calc_macd(df_1m['Close'])], axis=1)
         
         current_atr = df_1m['ATR'].iloc[-1]
         current_rsi = df_1m['RSI'].iloc[-1]
+        current_adx = df_1m['ADX'].iloc[-1]
         avg_price = df_1m['Close'].iloc[-1]
         
         if pd.isna(current_atr) or (current_atr / avg_price) < 0.00010:
             return {"status": False, "reason": "Ринок у стані флету (низький ATR)"}
+            
+        if pd.isna(current_adx) or current_adx < 22:
+            return {"status": False, "reason": f"Слабкий тренд або флет (ADX: {current_adx:.1f} < 22)"}
             
         def get_trend(df):
             if len(df) < 50: 
@@ -307,49 +337,38 @@ async def analyze_market(pair: str) -> dict:
             return "Bullish" if e20 > e50 else "Bearish"
 
         trend_1d = get_trend(df_1d)
-        trend_4h = get_trend(df_4h)
         trend_1h = get_trend(df_1h)
-        trend_15m = get_trend(df_15m)
 
         fvg_val = detect_fvg(df_5m)
         ob_val = detect_order_block(df_5m)
 
         score = 50  
         
-        # ВИПРАВЛЕНО: замінено квадратною дужкою на круглу у генераторах
-        bullish_weights = sum(1 for t in (trend_1d, trend_4h, trend_1h, trend_15m) if t == "Bullish")
-        bearish_weights = sum(1 for t in (trend_1d, trend_4h, trend_1h, trend_15m) if t == "Bearish")
+        bullish_weights = sum(1 for t in (trend_1d, trend_1h) if t == "Bullish")
+        bearish_weights = sum(1 for t in (trend_1d, trend_1h) if t == "Bearish")
 
-        if bullish_weights > bearish_weights:
+        if bullish_weights >= bearish_weights:
             direction = "🟢 CALL (Вгору)"
-            score += bullish_weights * 8
-            if "Bullish" in fvg_val: 
-                score += 12
-            if "Bullish" in ob_val: 
-                score += 10
-            if current_rsi < 65: 
-                score += 10
+            score += bullish_weights * 10
+            if "Bullish" in fvg_val: score += 15
+            if "Bullish" in ob_val: score += 15
+            if current_rsi < 65: score += 10
         else:
             direction = "🔴 PUT (Вниз)"
-            score += bearish_weights * 8
-            if "Bearish" in fvg_val: 
-                score += 12
-            if "Bearish" in ob_val: 
-                score += 10
-            if current_rsi > 35: 
-                score += 10
+            score += bearish_weights * 10
+            if "Bearish" in fvg_val: score += 15
+            if "Bearish" in ob_val: score += 15
+            if current_rsi > 35: score += 10
+
+        if check_volume_spike(df_1m):
+            score += 10
 
         confidence = int(min(98, max(65, score)))
-        if confidence < 75:
-            return {"status": False, "reason": f"Низька загальна сумісність індикаторів (Score: {score})"}
+        if confidence < 78:
+            return {"status": False, "reason": f"Низька сумісність індикаторів (Score: {score})"}
 
         atr_ratio = current_atr / avg_price
-        if atr_ratio > 0.0008:
-            expiry_minutes = 3
-        elif atr_ratio > 0.0004:
-            expiry_minutes = 5
-        else:
-            expiry_minutes = 15
+        expiry_minutes = 3 if atr_ratio > 0.0008 else (5 if atr_ratio > 0.0004 else 15)
             
         recent_data = df_1m.tail(1000)
         min_p, max_p = recent_data['Close'].min(), recent_data['Close'].max()
@@ -438,12 +457,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer(f"⏳ Зачекайте {COOLDOWN_TIME} секунд!", show_alert=True)
             return
         await query.edit_message_text(text="<b>⏳ Глибоке мульти-ТФ сканування ринку...</b>", parse_mode="HTML")
-        tasks = [analyze_market(p) for p in PAIR_MAPPING.keys()]
-        results = await asyncio.gather(*tasks)
+        
+        # Послідовне сканування з паузами для уникнення лімітів API
+        results = []
+        for p in PAIR_MAPPING.keys():
+            r = await analyze_market(p)
+            results.append(r)
+            await asyncio.sleep(0.3)
+
         res_text = "<b>📊 Звіт мультитаймфрейм сканування:</b>\n\n"
+        found = False
         for r in results:
             if r["status"]:
                 res_text += f"💱 <b>{r['pair']}</b> | {r['direction']} | {r['confidence']}%\n"
+                found = True
+        if not found:
+            res_text += "<i>Наразі немає активних сигналів із високою точністю.</i>"
+            
         keyboard = [[InlineKeyboardButton("🔙 Меню", callback_data="back_menu")]]
         await query.edit_message_text(text=res_text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
     elif data == "back_menu":
@@ -469,7 +499,7 @@ def background_market_scanner_sync(bot):
                     await bot.send_message(chat_id=NOTIFICATION_CHAT_ID, text=text, parse_mode="HTML")
             except Exception as e:
                 logging.error(f"Помилка у фоновому сканері для {pair}: {e}")
-            await asyncio.sleep(5)
+            await asyncio.sleep(2)
     loop.run_until_complete(scan())
     loop.close()
 
