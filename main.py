@@ -76,10 +76,8 @@ def calc_ema(series, length):
 def detect_fvg(df):
     if len(df) < 3:
         return "None"
-    # Bullish Fvg: Low of current > High of 2 candles ago
     if df['Low'].iloc[-1] > df['High'].iloc[-3]:
         return "Bullish FVG"
-    # Bearish Fvg: High of current < Low of 2 candles ago
     elif df['High'].iloc[-1] < df['Low'].iloc[-3]:
         return "Bearish FVG"
     return "None"
@@ -87,7 +85,6 @@ def detect_fvg(df):
 def detect_order_block(df):
     if len(df) < 5:
         return "None"
-    # Simple OB logic: Strong impulsive candle preceded by opposite color candle
     last_body = df['Close'].iloc[-2] - df['Open'].iloc[-2]
     prev_body = df['Close'].iloc[-3] - df['Open'].iloc[-3]
     if last_body > 0 and prev_body < 0:
@@ -274,7 +271,6 @@ def generate_market_chart(df_1m: pd.DataFrame, pair: str, direction: str, entry_
 async def analyze_market(pair: str) -> dict:
     ticker_symbol = PAIR_MAPPING.get(pair)
     try:
-        # Завантаження всіх таймфреймів паралельно
         df_1m, df_5m, df_15m, df_30m, df_1h, df_4h, df_1d = await asyncio.gather(
             cached_yf_download(ticker_symbol, period="1d", interval="1m"),
             cached_yf_download(ticker_symbol, period="5d", interval="5m"),
@@ -283,21 +279,18 @@ async def analyze_market(pair: str) -> dict:
             cached_yf_download(ticker_symbol, period="30d", interval="1h"),
             cached_yf_download(ticker_symbol, period="60d", interval="4h"),
             cached_yf_download(ticker_symbol, period="1y", interval="1d")
-        ]
+        )
         
         if df_1m.empty or df_1h.empty or df_1d.empty or len(df_1m) < 30:
             return {"status": False, "reason": "Недостатньо даних котирувань мульти-ТФ"}
         
-        # Перевірка торгової сесії (бажано уникати мертвих годин, хоча для форексу 24/5)
         current_hour = datetime.now(timezone.utc).hour
-        if current_hour in [21, 22, 23]: # Кінець дня / нічний роловер
+        if current_hour in [21, 22, 23]:
             return {"status": False, "reason": "Нічний роловер ринку (низька ліквідність)"}
 
-        # Розрахунок індикаторів
         df_1m['ATR'] = calc_atr(df_1m, length=14)
         df_1m['RSI'] = calc_rsi(df_1m['Close'], length=14)
         df_1m = pd.concat([df_1m, calc_macd(df_1m['Close'])], axis=1)
-        df_1m = pd.concat([df_1m, calc_ema(df_1m['Close'], 20)], axis=1) # генерує серію чи df
         
         current_atr = df_1m['ATR'].iloc[-1]
         current_rsi = df_1m['RSI'].iloc[-1]
@@ -306,9 +299,9 @@ async def analyze_market(pair: str) -> dict:
         if pd.isna(current_atr) or (current_atr / avg_price) < 0.00010:
             return {"status": False, "reason": "Ринок у стані флету (низький ATR)"}
             
-        # Тренди по старших таймфреймах через EMA 20 та 50
         def get_trend(df):
-            if len(df) < 50: return "Neutral"
+            if len(df) < 50: 
+                return "Neutral"
             e20 = calc_ema(df['Close'], 20).iloc[-1]
             e50 = calc_ema(df['Close'], 50).iloc[-1]
             return "Bullish" if e20 > e50 else "Bearish"
@@ -318,35 +311,37 @@ async def analyze_market(pair: str) -> dict:
         trend_1h = get_trend(df_1h)
         trend_15m = get_trend(df_15m)
 
-        # SMC паттерни
         fvg_val = detect_fvg(df_5m)
         ob_val = detect_order_block(df_5m)
 
-        # Математичний розрахунок балів (Score System)
-        score = 50  # Базова точка
+        score = 50  
         
-        # Визначення напрямку на основі гармонії старших ТФ
-        bullish_weights = sum([1 for t in [trend_1d, trend_4h, trend_1h, trend_15m] if t == "Bullish"])
-        bearish_weights = sum([1 for t in [trend_1d, trend_4h, trend_1h, trend_15m] if t == "Bearish"])
+        bullish_weights = sum(1 for t in [trend_1d, trend_4h, trend_1h, trend_15m] if t == "Bullish")
+        bearish_weights = sum(1 for t in [trend_1d, trend_4h, trend_1h, trend_15m] if t == "Bearish")
 
         if bullish_weights > bearish_weights:
             direction = "🟢 CALL (Вгору)"
             score += bullish_weights * 8
-            if "Bullish" in fvg_val: score += 12
-            if "Bullish" in ob_val: score += 10
-            if current_rsi < 65: score += 10
+            if "Bullish" in fvg_val: 
+                score += 12
+            if "Bullish" in ob_val: 
+                score += 10
+            if current_rsi < 65: 
+                score += 10
         else:
             direction = "🔴 PUT (Вниз)"
             score += bearish_weights * 8
-            if "Bearish" in fvg_val: score += 12
-            if "Bearish" in ob_val: score += 10
-            if current_rsi > 35: score += 10
+            if "Bearish" in fvg_val: 
+                score += 12
+            if "Bearish" in ob_val: 
+                score += 10
+            if current_rsi > 35: 
+                score += 10
 
         confidence = int(min(98, max(65, score)))
         if confidence < 75:
             return {"status": False, "reason": f"Низька загальна сумісність індикаторів (Score: {score})"}
 
-        # Динамічна експірація через ATR
         atr_ratio = current_atr / avg_price
         if atr_ratio > 0.0008:
             expiry_minutes = 3
@@ -355,7 +350,6 @@ async def analyze_market(pair: str) -> dict:
         else:
             expiry_minutes = 15
             
-        # Volume Profile POC
         recent_data = df_1m.tail(1000)
         min_p, max_p = recent_data['Close'].min(), recent_data['Close'].max()
         bins = np.linspace(min_p, max_p, 30)
