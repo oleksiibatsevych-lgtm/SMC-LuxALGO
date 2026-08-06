@@ -2,7 +2,6 @@ python-telegram-bot==21.1.1
 asyncpg==0.29.0
 pandas==2.2.1
 numpy==1.26.4
-git+https://github.com/twopirllc/pandas-ta.git
 yfinance==0.2.38
 matplotlib==3.8.3
 apscheduler==3.10.4
