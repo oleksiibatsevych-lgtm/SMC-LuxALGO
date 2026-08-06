@@ -6,9 +6,6 @@ import asyncpg
 import asyncio
 import io
 import pickle
-import threading
-import http.server
-import socketserver
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -29,6 +26,7 @@ NOTIFICATION_CHAT_ID = os.getenv("NOTIFICATION_CHAT_ID")
 DATABASE_URL = os.getenv("DATABASE_URL")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 PORT = int(os.getenv("PORT", 10000))
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "https://smc-luxalgo.onrender.com")
 
 allowed_env = os.getenv("ALLOWED_USER_IDS", "")
 ALLOWED_USER_IDS = [int(uid.strip()) for uid in allowed_env.split(",") if uid.strip().isdigit()]
@@ -496,22 +494,15 @@ def main():
         scheduler.add_job(background_market_scanner_sync, 'interval', minutes=15, args=[application.bot])
     scheduler.start()
     
-    # Запуск вбудованого http-сервера для Render у окремому потоці без зайвих конфліктів getUpdates
-    class HealthCheckHandler(http.server.BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"Bot is running!")
-        def log_message(self, format, *args):
-            pass
-
-    with socketserver.TCPServer(("", PORT), HealthCheckHandler) as httpd:
-        server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-        server_thread.start()
-        logging.info(f"Веб-сервер запущено на порті {PORT}, запускаємо polling бота...")
-        
-        # Використовуємо drop_pending_updates=True, щоб скинути всі старі підвішені запити getUpdates
-        application.run_polling(drop_pending_updates=True)
+    webhook_url = f"{RENDER_EXTERNAL_URL.rstrip('/')}/{BOT_TOKEN}"
+    logging.info(f"Запуск вебхука на URL: {webhook_url}")
+    
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=BOT_TOKEN,
+        webhook_url=webhook_url
+    )
 
 if __name__ == "__main__":
     main()
