@@ -6,6 +6,9 @@ import asyncpg
 import asyncio
 import io
 import pickle
+import threading
+import http.server
+import socketserver
 import numpy as np
 import pandas as pd
 import pandas_ta as ta
@@ -26,6 +29,21 @@ CACHE_TTL = 120
 NOTIFICATION_CHAT_ID = os.getenv("NOTIFICATION_CHAT_ID")
 DATABASE_URL = os.getenv("DATABASE_URL")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+PORT = int(os.getenv("PORT", 10000))
+
+# Міні-веб-сервер для задоволення вимог Render до Web Service
+def run_dummy_server():
+    class HealthCheckHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"Bot is running!")
+        def log_message(self, format, *args):
+            pass # Відключаємо зайві логування запитів сервера
+
+    with socketserver.TCPServer(("", PORT), HealthCheckHandler) as httpd:
+        logging.info(f"Веб-сервер для Render запущено на порті {PORT}")
+        httpd.serve_forever()
 
 allowed_env = os.getenv("ALLOWED_USER_IDS", "")
 ALLOWED_USER_IDS = [int(uid.strip()) for uid in allowed_env.split(",") if uid.strip().isdigit()]
@@ -425,6 +443,10 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 def main():
+    # Запуск міні-сервера у фоновому потоці для проходження перевірки портів на Render
+    server_thread = threading.Thread(target=run_dummy_server, daemon=True)
+    server_thread.start()
+
     loop = asyncio.get_event_loop()
     loop.run_until_complete(init_db())
     application = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -436,7 +458,7 @@ def main():
     if NOTIFICATION_CHAT_ID:
         scheduler.add_job(background_market_scanner, 'interval', minutes=15, args=[application])
     scheduler.start()
-    print("Бот з підтримкою PostgreSQL та повною логікою аналізу успішно запущено...")
+    print("Бот з підтримкою PostgreSQL та веб-сервером успішно запущено...")
     application.run_polling()
 
 if __name__ == "__main__":
