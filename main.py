@@ -30,19 +30,6 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 PORT = int(os.getenv("PORT", 10000))
 
-def run_dummy_server():
-    class HealthCheckHandler(http.server.BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"Bot is running!")
-        def log_message(self, format, *args):
-            pass
-
-    with socketserver.TCPServer(("", PORT), HealthCheckHandler) as httpd:
-        logging.info(f"Веб-сервер для Render запущено на порті {PORT}")
-        httpd.serve_forever()
-
 allowed_env = os.getenv("ALLOWED_USER_IDS", "")
 ALLOWED_USER_IDS = [int(uid.strip()) for uid in allowed_env.split(",") if uid.strip().isdigit()]
 
@@ -493,17 +480,8 @@ def background_trade_checker_sync(bot):
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logging.error(f"Виняток при обробці оновлення: {context.error}")
-    if NOTIFICATION_CHAT_ID:
-        try:
-            err_msg = f"⚠️ <b>Критична помилка в боті:</b>\n<code>{str(context.error)}</code>"
-            await context.bot.send_message(chat_id=NOTIFICATION_CHAT_ID, text=err_msg, parse_mode="HTML")
-        except Exception:
-            pass
 
 def main():
-    server_thread = threading.Thread(target=run_dummy_server, daemon=True)
-    server_thread.start()
-
     loop = asyncio.get_event_loop()
     loop.run_until_complete(init_db())
     
@@ -518,8 +496,22 @@ def main():
         scheduler.add_job(background_market_scanner_sync, 'interval', minutes=15, args=[application.bot])
     scheduler.start()
     
-    print("Бот успішно запущено з BackgroundScheduler...")
-    application.run_polling()
+    # Запуск вбудованого http-сервера для Render у окремому потоці без зайвих конфліктів getUpdates
+    class HealthCheckHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"Bot is running!")
+        def log_message(self, format, *args):
+            pass
+
+    with socketserver.TCPServer(("", PORT), HealthCheckHandler) as httpd:
+        server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        server_thread.start()
+        logging.info(f"Веб-сервер запущено на порті {PORT}, запускаємо polling бота...")
+        
+        # Використовуємо drop_pending_updates=True, щоб скинути всі старі підвішені запити getUpdates
+        application.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
