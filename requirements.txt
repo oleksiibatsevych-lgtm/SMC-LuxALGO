@@ -1,8 +1,8 @@
-python-telegram-bot
-numpy
-pandas
-yfinance
-matplotlib
+python-telegram-bot[webhooks]
 asyncpg
 apscheduler
+yfinance
+pandas
+numpy
+matplotlib
 tenacity
