@@ -438,14 +438,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard.append([InlineKeyboardButton("📈 Статистика", callback_data="show_stats")])
         await query.edit_message_text("Оберіть пару:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-def run_async_task(coro):
-    asyncio.run(coro)
-
 def background_market_scanner_sync(bot):
     if not NOTIFICATION_CHAT_ID:
         return
     loop = asyncio.new_event_loop()
-    async asyncio.set_event_loop(loop)
+    asyncio.set_event_loop(loop)
     async def scan():
         for pair in PAIR_MAPPING.keys():
             try:
@@ -490,7 +487,7 @@ def background_trade_checker_sync(bot):
             logging.error(f"Помилка у фоновій перевірці угод: {e}")
     
     loop = asyncio.new_event_loop()
-    async asyncio.set_event_loop(loop)
+    asyncio.set_event_loop(loop)
     loop.run_until_complete(check())
     loop.close()
 
