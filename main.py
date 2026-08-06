@@ -17,7 +17,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 from tenacity import retry, stop_after_attempt, wait_fixed
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.schedulers.background import BackgroundScheduler
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, CallbackQueryHandler
@@ -30,7 +30,6 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 PORT = int(os.getenv("PORT", 10000))
 
-# Міні-веб-сервер для задоволення вимог Render до Web Service
 def run_dummy_server():
     class HealthCheckHandler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
@@ -60,7 +59,6 @@ PAIR_MAPPING = {
     "AUD/JPY": "AUDJPY=X", "EUR/JPY": "EURJPY=X", "GBP/CAD": "GBPCAD=X"
 }
 
-# Власні розрахунки індикаторів на базі pandas/numpy (заміна pandas_ta)
 def calc_rsi(series, period=14):
     delta = series.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
@@ -440,47 +438,61 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard.append([InlineKeyboardButton("📈 Статистика", callback_data="show_stats")])
         await query.edit_message_text("Оберіть пару:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-async def background_market_scanner(context: ContextTypes.DEFAULT_TYPE):
+def run_async_task(coro):
+    asyncio.run(coro)
+
+def background_market_scanner_sync(bot):
     if not NOTIFICATION_CHAT_ID:
         return
-    for pair in PAIR_MAPPING.keys():
-        try:
-            res = await analyze_market(pair)
-            if res["status"] and res["confidence"] >= 90:
-                text = f"🔥 <b>АВТО-СИГНАЛ (>90%)</b>\n💱 {pair}\n{res['direction']} | Ймовірність: {res['confidence']}%"
-                await context.bot.send_message(chat_id=NOTIFICATION_CHAT_ID, text=text, parse_mode="HTML")
-        except Exception as e:
-            logging.error(f"Помилка у фоновому сканері для {pair}: {e}")
-        await asyncio.sleep(5)
+    loop = asyncio.new_event_loop()
+    async asyncio.set_event_loop(loop)
+    async def scan():
+        for pair in PAIR_MAPPING.keys():
+            try:
+                res = await analyze_market(pair)
+                if res["status"] and res["confidence"] >= 90:
+                    text = f"🔥 <b>АВТО-СИГНАЛ (>90%)</b>\n💱 {pair}\n{res['direction']} | Ймовірність: {res['confidence']}%"
+                    await bot.send_message(chat_id=NOTIFICATION_CHAT_ID, text=text, parse_mode="HTML")
+            except Exception as e:
+                logging.error(f"Помилка у фоновому сканері для {pair}: {e}")
+            await asyncio.sleep(5)
+    loop.run_until_complete(scan())
+    loop.close()
 
-async def background_trade_checker(context: ContextTypes.DEFAULT_TYPE):
-    try:
-        conn = await asyncpg.connect(DATABASE_URL)
+def background_trade_checker_sync(bot):
+    async def check():
         try:
-            rows = await conn.fetch('SELECT id, chat_id, pair, direction, entry_price, expiry_time FROM active_signals WHERE expiry_time <= $1', time.time())
-        finally:
-            await conn.close()
-        for row in rows:
-            sig_id, chat_id, pair, direction, entry_price = row['id'], row['chat_id'], row['pair'], row['direction'], row['entry_price']
-            ticker = PAIR_MAPPING.get(pair)
-            df = await cached_yf_download(ticker, period="1d", interval="1m")
-            if not df.empty:
-                current_price = df['Close'].iloc[-1]
-                is_call = "CALL" in direction
-                is_win = (current_price > entry_price) if is_call else (current_price < entry_price)
-                await update_outcome(pair, is_win)
-                try:
-                    result_text = f"🤖 <b>Авто-результат угоди ({pair}):</b> {'ПЛЮС ✅' if is_win else 'МІНУС ❌'}\nВхід: {entry_price:.5f} | Закінчення: {current_price:.5f}"
-                    await context.bot.send_message(chat_id=chat_id, text=result_text, parse_mode="HTML")
-                except Exception as e:
-                    logging.error(f"Не вдалося надіслати результат у чат {chat_id}: {e}")
             conn = await asyncpg.connect(DATABASE_URL)
             try:
-                await conn.execute('DELETE FROM active_signals WHERE id = $1', sig_id)
+                rows = await conn.fetch('SELECT id, chat_id, pair, direction, entry_price, expiry_time FROM active_signals WHERE expiry_time <= $1', time.time())
             finally:
                 await conn.close()
-    except Exception as e:
-        logging.error(f"Помилка у фоновій перевірці угод: {e}")
+            for row in rows:
+                sig_id, chat_id, pair, direction, entry_price = row['id'], row['chat_id'], row['pair'], row['direction'], row['entry_price']
+                ticker = PAIR_MAPPING.get(pair)
+                df = await cached_yf_download(ticker, period="1d", interval="1m")
+                if not df.empty:
+                    current_price = df['Close'].iloc[-1]
+                    is_call = "CALL" in direction
+                    is_win = (current_price > entry_price) if is_call else (current_price < entry_price)
+                    await update_outcome(pair, is_win)
+                    try:
+                        result_text = f"🤖 <b>Авто-результат угоди ({pair}):</b> {'ПЛЮС ✅' if is_win else 'МІНУС ❌'}\nВхід: {entry_price:.5f} | Закінчення: {current_price:.5f}"
+                        await bot.send_message(chat_id=chat_id, text=result_text, parse_mode="HTML")
+                    except Exception as e:
+                        logging.error(f"Не вдалося надіслати результат у чат {chat_id}: {e}")
+                conn = await asyncpg.connect(DATABASE_URL)
+                try:
+                    await conn.execute('DELETE FROM active_signals WHERE id = $1', sig_id)
+                finally:
+                    await conn.close()
+        except Exception as e:
+            logging.error(f"Помилка у фоновій перевірці угод: {e}")
+    
+    loop = asyncio.new_event_loop()
+    async asyncio.set_event_loop(loop)
+    loop.run_until_complete(check())
+    loop.close()
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logging.error(f"Виняток при обробці оновлення: {context.error}")
@@ -497,16 +509,19 @@ def main():
 
     loop = asyncio.get_event_loop()
     loop.run_until_complete(init_db())
+    
     application = ApplicationBuilder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_error_handler(error_handler)
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(background_trade_checker, 'interval', seconds=30, args=[application])
+    
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(background_trade_checker_sync, 'interval', seconds=30, args=[application.bot])
     if NOTIFICATION_CHAT_ID:
-        scheduler.add_job(background_market_scanner, 'interval', minutes=15, args=[application])
+        scheduler.add_job(background_market_scanner_sync, 'interval', minutes=15, args=[application.bot])
     scheduler.start()
-    print("Бот з підтримкою PostgreSQL та власними розрахунками успішно запущено...")
+    
+    print("Бот успішно запущено з BackgroundScheduler...")
     application.run_polling()
 
 if __name__ == "__main__":
