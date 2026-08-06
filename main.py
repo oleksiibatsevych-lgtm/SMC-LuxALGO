@@ -11,7 +11,6 @@ import http.server
 import socketserver
 import numpy as np
 import pandas as pd
-import pandas_ta as ta
 import yfinance as yf
 import matplotlib
 matplotlib.use('Agg')
@@ -39,7 +38,7 @@ def run_dummy_server():
             self.end_headers()
             self.wfile.write(b"Bot is running!")
         def log_message(self, format, *args):
-            pass # Відключаємо зайві логування запитів сервера
+            pass
 
     with socketserver.TCPServer(("", PORT), HealthCheckHandler) as httpd:
         logging.info(f"Веб-сервер для Render запущено на порті {PORT}")
@@ -60,6 +59,45 @@ PAIR_MAPPING = {
     "USD/CHF": "USDCHF=X", "EUR/GBP": "EURGBP=X", "USD/JPY": "USDJPY=X", 
     "AUD/JPY": "AUDJPY=X", "EUR/JPY": "EURJPY=X", "GBP/CAD": "GBPCAD=X"
 }
+
+# Власні розрахунки індикаторів на базі pandas/numpy (заміна pandas_ta)
+def calc_rsi(series, period=14):
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+def calc_atr(df, period=14):
+    high_low = df['High'] - df['Low']
+    high_close = np.abs(df['High'] - df['Close'].shift())
+    low_close = np.abs(df['Low'] - df['Close'].shift())
+    true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    return true_range.rolling(window=period).mean()
+
+def calc_macd(series, fast=12, slow=26, signal=9):
+    ema_fast = series.ewm(span=fast, adjust=False).mean()
+    ema_slow = series.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    macd_hist = macd_line - signal_line
+    return pd.DataFrame({
+        'MACD': macd_line,
+        'MACDs': signal_line,
+        'MACDh_12_26_9': macd_hist
+    })
+
+def calc_bbands(series, length=20, std=2):
+    sma = series.rolling(window=length).mean()
+    r_std = series.rolling(window=length).std()
+    return pd.DataFrame({
+        'BBL': sma - (r_std * std),
+        'BBM': sma,
+        'BBU': sma + (r_std * std)
+    })
+
+def calc_ema(series, length):
+    return series.ewm(span=length, adjust=False).mean()
 
 async def init_db():
     conn = await asyncpg.connect(DATABASE_URL)
@@ -245,20 +283,25 @@ async def analyze_market(pair: str) -> dict:
         )
         if df_1m.empty or df_1h.empty or len(df_1m) < 30 or len(df_1h) < 10:
             return {"status": False, "reason": "Недостатньо даних котирувань"}
-        df_1m['ATR'] = ta.atr(df_1m['High'], df_1m['Low'], df_1m['Close'], length=14)
-        df_1m['RSI'] = ta.rsi(df_1m['Close'], length=14)
-        macd = ta.macd(df_1m['Close'])
+        
+        df_1m['ATR'] = calc_atr(df_1m, length=14)
+        df_1m['RSI'] = calc_rsi(df_1m['Close'], length=14)
+        macd = calc_macd(df_1m['Close'])
         df_1m = pd.concat([df_1m, macd], axis=1)
-        bbands = ta.bbands(df_1m['Close'], length=20)
+        bbands = calc_bbands(df_1m['Close'], length=20)
         df_1m = pd.concat([df_1m, bbands], axis=1)
+        
         current_atr = df_1m['ATR'].iloc[-1]
         current_rsi = df_1m['RSI'].iloc[-1]
         avg_price = df_1m['Close'].iloc[-1]
+        
         if pd.isna(current_atr) or (current_atr / avg_price) < 0.00012:
             return {"status": False, "reason": "Ринок у стані флету (низький ATR)"}
-        df_1h['EMA20'] = ta.ema(df_1h['Close'], length=20)
-        df_1h['EMA50'] = ta.ema(df_1h['Close'], length=50)
+            
+        df_1h['EMA20'] = calc_ema(df_1h['Close'], length=20)
+        df_1h['EMA50'] = calc_ema(df_1h['Close'], length=50)
         trend_1h_bullish = df_1h['EMA20'].iloc[-1] > df_1h['EMA50'].iloc[-1]
+        
         atr_ratio = current_atr / avg_price
         if atr_ratio > 0.0008:
             expiry_minutes = 1
@@ -266,6 +309,7 @@ async def analyze_market(pair: str) -> dict:
             expiry_minutes = 5
         else:
             expiry_minutes = 15
+            
         recent_data = df_1m.tail(1000)
         min_p, max_p = recent_data['Close'].min(), recent_data['Close'].max()
         bins = np.linspace(min_p, max_p, 30)
@@ -273,16 +317,20 @@ async def analyze_market(pair: str) -> dict:
         vol_profile = recent_data.groupby(hist, observed=False)['Volume'].sum()
         poc_bin = vol_profile.idxmax()
         poc_price = (poc_bin.left + poc_bin.right) / 2
+        
         df_1m['BodyMax'] = df_1m[['Open', 'Close']].max(axis=1)
         df_1m['BodyMin'] = df_1m[['Open', 'Close']].min(axis=1)
         body_high_rolling = df_1m['BodyMax'].rolling(window=10).max()
         body_low_rolling = df_1m['BodyMin'].rolling(window=10).min()
         current_close = df_1m['Close'].iloc[-1]
+        
         bullish_bos = current_close > body_high_rolling.iloc[-3]
         bearish_bos = current_close < body_low_rolling.iloc[-3]
         ob_status = "Bullish BOS" if bullish_bos else ("Bearish BOS" if bearish_bos else "Флет структура")
         fvg_status = "Немає FVG"
+        
         macd_hist = df_1m.iloc[-1].get('MACDh_12_26_9', 0)
+        
         if trend_1h_bullish and (bullish_bos or macd_hist > 0) and current_rsi < 70:
             direction = "🟢 CALL (Вгору)"
             confidence = random.randint(90, 98)
@@ -297,6 +345,7 @@ async def analyze_market(pair: str) -> dict:
             confidence = random.randint(80, 89)
         else:
             return {"status": False, "reason": "Суперечливі дані індикаторів"}
+            
         await update_statistics(pair, direction, confidence)
         return {
             "status": True, "pair": pair, "direction": direction, "confidence": confidence,
@@ -443,7 +492,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 def main():
-    # Запуск міні-сервера у фоновому потоці для проходження перевірки портів на Render
     server_thread = threading.Thread(target=run_dummy_server, daemon=True)
     server_thread.start()
 
@@ -458,7 +506,7 @@ def main():
     if NOTIFICATION_CHAT_ID:
         scheduler.add_job(background_market_scanner, 'interval', minutes=15, args=[application])
     scheduler.start()
-    print("Бот з підтримкою PostgreSQL та веб-сервером успішно запущено...")
+    print("Бот з підтримкою PostgreSQL та власними розрахунками успішно запущено...")
     application.run_polling()
 
 if __name__ == "__main__":
