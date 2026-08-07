@@ -12,6 +12,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from tenacity import retry, stop_after_attempt, wait_fixed
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -296,9 +297,14 @@ def generate_market_chart(df_1m: pd.DataFrame, pair: str, direction: str, entry_
     return buf
 
 async def analyze_market(pair: str) -> dict:
+    # Перевірка часу: бот працює лише з 10:00 до 22:00 за київським часом
+    kyiv_now = datetime.now(ZoneInfo("Europe/Kyiv"))
+    current_hour = kyiv_now.hour
+    if not (10 <= current_hour < 22):
+        return {"status": False, "reason": f"Бот працює з 10:00 до 22:00 за Києвом (Зараз: {kyiv_now.strftime('%H:%M')})"}
+
     ticker_symbol = PAIR_MAPPING.get(pair)
     try:
-        # Оптимізовані 4 таймфрейми для захисту від блокування Yahoo Finance
         df_1m, df_5m, df_1h, df_1d = await asyncio.gather(
             cached_yf_download(ticker_symbol, period="1d", interval="1m"),
             cached_yf_download(ticker_symbol, period="5d", interval="5m"),
@@ -308,10 +314,6 @@ async def analyze_market(pair: str) -> dict:
         
         if df_1m.empty or df_1h.empty or df_1d.empty or len(df_1m) < 30:
             return {"status": False, "reason": "Недостатньо даних котирувань мульти-ТФ"}
-        
-        current_hour = datetime.now(timezone.utc).hour
-        if current_hour in [21, 22, 23]:
-            return {"status": False, "reason": "Нічний роловер ринку (низька ліквідність)"}
 
         df_1m['ATR'] = calc_atr(df_1m, length=14)
         df_1m['RSI'] = calc_rsi(df_1m['Close'], length=14)
@@ -458,12 +460,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await query.edit_message_text(text="<b>⏳ Глибоке мульти-ТФ сканування ринку...</b>", parse_mode="HTML")
         
-        # Послідовне сканування з паузами для уникнення лімітів API
         results = []
         for p in PAIR_MAPPING.keys():
             r = await analyze_market(p)
             results.append(r)
             await asyncio.sleep(0.3)
+
+        # Якщо бот повернув помилку не за розкладом на першій же парі
+        if results and not results[0]["status"] and "працює з 10:00 до 22:00" in results[0]["reason"]:
+            keyboard = [[InlineKeyboardButton("🔙 Меню", callback_data="back_menu")]]
+            await query.edit_message_text(text=f"⚠️ {results[0]['reason']}", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+            return
 
         res_text = "<b>📊 Звіт мультитаймфрейм сканування:</b>\n\n"
         found = False
