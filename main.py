@@ -18,8 +18,8 @@ from zoneinfo import ZoneInfo
 from tenacity import retry, stop_after_attempt, wait_fixed
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
-from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, CallbackQueryHandler, MessageHandler, filters
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, CallbackQueryHandler
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
@@ -325,11 +325,12 @@ async def analyze_market(pair: str) -> dict:
         current_adx = df_1m['ADX'].iloc[-1]
         avg_price = df_1m['Close'].iloc[-1]
         
-        if pd.isna(current_atr) or (current_atr / avg_price) < 0.00010:
+        if pd.isna(current_atr) or (current_atr / avg_price) < 0.00008:
             return {"status": False, "reason": "Ринок у стані флету (низький ATR)"}
             
-        if pd.isna(current_adx) or current_adx < 18:
-            return {"status": False, "reason": f"Слабкий тренд або флет (ADX: {current_adx:.1f} < 18)"}
+        # Змінено поріг ADX з 18 на 15 для більшої кількості сигналів
+        if pd.isna(current_adx) or current_adx < 15:
+            return {"status": False, "reason": f"Слабкий тренд або флет (ADX: {current_adx:.1f} < 15)"}
             
         def get_trend(df):
             if len(df) < 50: 
@@ -365,8 +366,9 @@ async def analyze_market(pair: str) -> dict:
         if check_volume_spike(df_1m):
             score += 10
 
-        confidence = int(min(98, max(65, score)))
-        if confidence < 74:
+        confidence = int(min(98, max(60, score)))
+        # Змінено мін. поріг Confidence з 74 на 70
+        if confidence < 70:
             return {"status": False, "reason": f"Низька сумісність індикаторів (Score: {score})"}
 
         atr_ratio = current_atr / avg_price
@@ -395,34 +397,62 @@ async def analyze_market(pair: str) -> dict:
         gc.collect()
         return {"status": False, "reason": "Помилка обчислення мульти-ТФ"}
 
+def get_main_menu_keyboard():
+    pairs = list(PAIR_MAPPING.keys())
+    keyboard = []
+    for i in range(0, len(pairs), 2):
+        keyboard.append([InlineKeyboardButton(pair, callback_data=f"sig_{pair}") for pair in pairs[i:i+2]])
+    keyboard.append([InlineKeyboardButton("📊 Аналіз усіх пар", callback_data="signal_all")])
+    keyboard.append([InlineKeyboardButton("📈 Статистика", callback_data="show_stats")])
+    return InlineKeyboardMarkup(keyboard)
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not check_access(update):
         await update.message.reply_text("⛔ У вас немає доступу.")
         return
-    pairs = list(PAIR_MAPPING.keys())
-    keyboard = []
-    for i in range(0, len(pairs), 2):
-        keyboard.append([pair for pair in pairs[i:i+2]])
-    keyboard.append(["📊 Аналіз усіх пар"])
-    keyboard.append(["📈 Статистика"])
-    
-    markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    await update.message.reply_text("👋 Вітаю! Мультитаймфреймовий сканер готовий. Оберіть пару в меню знизу:", reply_markup=markup)
+    await update.message.reply_text(
+        "👋 Вітаю! Мультитаймфреймовий сканер готовий. Оберіть пару нижче:",
+        reply_markup=get_main_menu_keyboard()
+    )
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    user_id = update.effective_user.id
-    if not check_access(update):
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
+        return
+    data = query.data
+
+    if data == "back_menu":
+        await query.edit_message_text(
+            text="👋 Оберіть пару для аналізу:",
+            reply_markup=get_main_menu_keyboard()
+        )
         return
 
-    if text in PAIR_MAPPING:
+    if data == "show_stats":
+        response_text = await get_statistics_text()
+        keyboard = [[InlineKeyboardButton("🔙 Меню", callback_data="back_menu")]]
+        await query.edit_message_text(text=response_text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    if data.startswith("win_") or data.startswith("loss_"):
+        is_win = data.startswith("win_")
+        pair = data.split("_", 1)[1]
+        await update_outcome(pair, is_win)
+        await query.answer("Результат збережено!", show_alert=False)
+        return
+
+    if data.startswith("sig_"):
+        target = data.split("_", 1)[1]
         if not check_antiflood(user_id):
-            await update.message.reply_text(f"⏳ Зачекайте {COOLDOWN_TIME} секунд перед наступним запитом!")
+            await query.answer(f"⏳ Зачекайте {COOLDOWN_TIME} секунд перед наступним запитом!", show_alert=True)
             return
         
-        res = await analyze_market(text)
+        res = await analyze_market(target)
         if not res["status"]:
-            await update.message.reply_text(f"⚠️ {res['reason']}")
+            keyboard = [[InlineKeyboardButton("🔙 Меню", callback_data="back_menu")]]
+            await query.edit_message_text(text=f"⚠️ {res['reason']}", reply_markup=InlineKeyboardMarkup(keyboard))
             return
             
         conn = await asyncpg.connect(DATABASE_URL)
@@ -430,13 +460,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await conn.execute('''
                 INSERT INTO active_signals (chat_id, pair, direction, entry_price, expiry_time, confidence)
                 VALUES ($1, $2, $3, $4, $5, $6)
-            ''', update.effective_chat.id, text, res["direction"], res["entry_price"], time.time() + (res["expiry"] * 60), res["confidence"])
+            ''', query.message.chat_id, target, res["direction"], res["entry_price"], time.time() + (res["expiry"] * 60), res["confidence"])
         finally:
             await conn.close()
             
-        chart_buf = await asyncio.to_thread(generate_market_chart, res["df"], text, res["direction"], res["entry_price"], res["poc"])
+        chart_buf = await asyncio.to_thread(generate_market_chart, res["df"], target, res["direction"], res["entry_price"], res["poc"])
         caption = (
-            f"💱 Пара: <b>{text}</b>\n"
+            f"💱 Пара: <b>{target}</b>\n"
             f"📈 Напрямок: <b>{res['direction']}</b>\n"
             f"⏳ Експірація: <b>{res['expiry']} хв</b>\n"
             f"🎯 Math Score: <b>{res['confidence']}%</b>\n"
@@ -444,15 +474,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📊 RSI: <code>{res['rsi']:.1f}</code> | POC: <code>{res['poc']:.5f}</code>\n"
         )
         keyboard = [
-            [InlineKeyboardButton("✅ Win", callback_data=f"win_{text}"), InlineKeyboardButton("❌ Loss", callback_data=f"loss_{text}")]
+            [InlineKeyboardButton("✅ Win", callback_data=f"win_{target}"), InlineKeyboardButton("❌ Loss", callback_data=f"loss_{target}")],
+            [InlineKeyboardButton("🔙 Меню", callback_data="back_menu")]
         ]
-        await context.bot.send_photo(chat_id=update.effective_chat.id, photo=chart_buf, caption=caption, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+        
+        await query.message.delete()
+        await context.bot.send_photo(chat_id=query.message.chat_id, photo=chart_buf, caption=caption, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
-    elif text == "📊 Аналіз усіх пар":
+    elif data == "signal_all":
         if not check_antiflood(user_id):
-            await update.message.reply_text(f"⏳ Зачекайте {COOLDOWN_TIME} секунд!")
+            await query.answer(f"⏳ Зачекайте {COOLDOWN_TIME} секунд!", show_alert=True)
             return
-        await update.message.reply_text("<b>⏳ Глибоке мульти-ТФ сканування ринку...</b>", parse_mode="HTML")
+        await query.edit_message_text(text="<b>⏳ Глибоке мульти-ТФ сканування ринку...</b>", parse_mode="HTML")
         
         results = []
         for p in PAIR_MAPPING.keys():
@@ -461,7 +494,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(0.3)
 
         if results and not results[0]["status"] and "працює з 09:00 до 22:00" in results[0]["reason"]:
-            await update.message.reply_text(f"⚠️ {results[0]['reason']}")
+            keyboard = [[InlineKeyboardButton("🔙 Меню", callback_data="back_menu")]]
+            await query.edit_message_text(text=f"⚠️ {results[0]['reason']}", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
             return
 
         res_text = "<b>📊 Звіт мультитаймфрейм сканування:</b>\n\n"
@@ -473,25 +507,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not found:
             res_text += "<i>Наразі немає активних сигналів із високою точністю.</i>"
             
-        await update.message.reply_text(res_text, parse_mode="HTML")
-
-    elif text == "📈 Статистика":
-        response_text = await get_statistics_text()
-        await update.message.reply_text(response_text, parse_mode="HTML")
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
-        return
-    data = query.data
-    if data.startswith("win_") or data.startswith("loss_"):
-        is_win = data.startswith("win_")
-        pair = data.split("_", 1)[1]
-        await update_outcome(pair, is_win)
-        await query.answer("Результат збережено!", show_alert=False)
-        return
+        keyboard = [[InlineKeyboardButton("🔙 Меню", callback_data="back_menu")]]
+        await query.edit_message_text(text=res_text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
 def background_market_scanner_sync(bot):
     if not NOTIFICATION_CHAT_ID:
@@ -555,7 +572,6 @@ def main():
     
     application = ApplicationBuilder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_error_handler(error_handler)
     
