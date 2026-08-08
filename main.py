@@ -5,6 +5,7 @@ import asyncpg
 import asyncio
 import io
 import pickle
+import gc
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -17,8 +18,8 @@ from zoneinfo import ZoneInfo
 from tenacity import retry, stop_after_attempt, wait_fixed
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, CallbackQueryHandler
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
+from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, CallbackQueryHandler, MessageHandler, filters
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
@@ -297,19 +298,18 @@ def generate_market_chart(df_1m: pd.DataFrame, pair: str, direction: str, entry_
     return buf
 
 async def analyze_market(pair: str) -> dict:
-    # Перевірка часу: бот працює лише з 10:00 до 22:00 за київським часом
     kyiv_now = datetime.now(ZoneInfo("Europe/Kyiv"))
     current_hour = kyiv_now.hour
-    if not (10 <= current_hour < 22):
-        return {"status": False, "reason": f"Бот працює з 10:00 до 22:00 за Києвом (Зараз: {kyiv_now.strftime('%H:%M')})"}
+    if not (9 <= current_hour < 22):
+        return {"status": False, "reason": f"Бот працює з 09:00 до 22:00 за Києвом (Зараз: {kyiv_now.strftime('%H:%M')})"}
 
     ticker_symbol = PAIR_MAPPING.get(pair)
     try:
         df_1m, df_5m, df_1h, df_1d = await asyncio.gather(
             cached_yf_download(ticker_symbol, period="1d", interval="1m"),
-            cached_yf_download(ticker_symbol, period="5d", interval="5m"),
-            cached_yf_download(ticker_symbol, period="30d", interval="1h"),
-            cached_yf_download(ticker_symbol, period="1y", interval="1d")
+            cached_yf_download(ticker_symbol, period="2d", interval="5m"),
+            cached_yf_download(ticker_symbol, period="7d", interval="1h"),
+            cached_yf_download(ticker_symbol, period="3mo", interval="1d")
         )
         
         if df_1m.empty or df_1h.empty or df_1d.empty or len(df_1m) < 30:
@@ -328,8 +328,8 @@ async def analyze_market(pair: str) -> dict:
         if pd.isna(current_atr) or (current_atr / avg_price) < 0.00010:
             return {"status": False, "reason": "Ринок у стані флету (низький ATR)"}
             
-        if pd.isna(current_adx) or current_adx < 22:
-            return {"status": False, "reason": f"Слабкий тренд або флет (ADX: {current_adx:.1f} < 22)"}
+        if pd.isna(current_adx) or current_adx < 18:
+            return {"status": False, "reason": f"Слабкий тренд або флет (ADX: {current_adx:.1f} < 18)"}
             
         def get_trend(df):
             if len(df) < 50: 
@@ -366,7 +366,7 @@ async def analyze_market(pair: str) -> dict:
             score += 10
 
         confidence = int(min(98, max(65, score)))
-        if confidence < 78:
+        if confidence < 74:
             return {"status": False, "reason": f"Низька сумісність індикаторів (Score: {score})"}
 
         atr_ratio = current_atr / avg_price
@@ -383,6 +383,8 @@ async def analyze_market(pair: str) -> dict:
         current_close = df_1m['Close'].iloc[-1]
 
         await update_statistics(pair, direction, confidence)
+        gc.collect()
+
         return {
             "status": True, "pair": pair, "direction": direction, "confidence": confidence,
             "entry_price": current_close, "expiry": expiry_minutes, "poc": poc_price,
@@ -390,58 +392,51 @@ async def analyze_market(pair: str) -> dict:
         }
     except Exception as e:
         logging.error(f"Помилка аналізу для {pair}: {e}")
+        gc.collect()
         return {"status": False, "reason": "Помилка обчислення мульти-ТФ"}
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not check_access(update):
         await update.message.reply_text("⛔ У вас немає доступу.")
         return
-    keyboard = []
     pairs = list(PAIR_MAPPING.keys())
+    keyboard = []
     for i in range(0, len(pairs), 2):
-        keyboard.append([InlineKeyboardButton(pair, callback_data=f"sig_{pair}") for pair in pairs[i:i+2]])
-    keyboard.append([InlineKeyboardButton("📊 Аналіз усіх пар", callback_data="signal_all")])
-    keyboard.append([InlineKeyboardButton("📈 Статистика", callback_data="show_stats")])
-    await update.message.reply_text("👋 Вітаю! Мультитаймфреймовий сканер готовий. Оберіть пару:", reply_markup=InlineKeyboardMarkup(keyboard))
+        keyboard.append([pair for pair in pairs[i:i+2]])
+    keyboard.append(["📊 Аналіз усіх пар"])
+    keyboard.append(["📈 Статистика"])
+    
+    markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    await update.message.reply_text("👋 Вітаю! Мультитаймфреймовий сканер готовий. Оберіть пару в меню знизу:", reply_markup=markup)
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    user_id = update.effective_user.id
+    if not check_access(update):
         return
-    data = query.data
-    if data == "show_stats":
-        response_text = await get_statistics_text()
-        keyboard = [[InlineKeyboardButton("🔙 Меню", callback_data="back_menu")]]
-        await query.edit_message_text(text=response_text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
-        return
-    if data.startswith("win_") or data.startswith("loss_"):
-        is_win = data.startswith("win_")
-        pair = data.split("_", 1)[1]
-        await update_outcome(pair, is_win)
-        await query.answer("Результат збережено!", show_alert=False)
-        return
-    if data.startswith("sig_"):
-        target = data.split("_", 1)[1]
+
+    if text in PAIR_MAPPING:
         if not check_antiflood(user_id):
-            await query.answer(f"⏳ Зачекайте {COOLDOWN_TIME} секунд перед наступним запитом!", show_alert=True)
+            await update.message.reply_text(f"⏳ Зачекайте {COOLDOWN_TIME} секунд перед наступним запитом!")
             return
-        res = await analyze_market(target)
+        
+        res = await analyze_market(text)
         if not res["status"]:
-            await query.edit_message_text(text=f"⚠️ {res['reason']}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Меню", callback_data="back_menu")]]))
+            await update.message.reply_text(f"⚠️ {res['reason']}")
             return
+            
         conn = await asyncpg.connect(DATABASE_URL)
         try:
             await conn.execute('''
                 INSERT INTO active_signals (chat_id, pair, direction, entry_price, expiry_time, confidence)
                 VALUES ($1, $2, $3, $4, $5, $6)
-            ''', query.message.chat_id, target, res["direction"], res["entry_price"], time.time() + (res["expiry"] * 60), res["confidence"])
+            ''', update.effective_chat.id, text, res["direction"], res["entry_price"], time.time() + (res["expiry"] * 60), res["confidence"])
         finally:
             await conn.close()
-        chart_buf = await asyncio.to_thread(generate_market_chart, res["df"], target, res["direction"], res["entry_price"], res["poc"])
+            
+        chart_buf = await asyncio.to_thread(generate_market_chart, res["df"], text, res["direction"], res["entry_price"], res["poc"])
         caption = (
-            f"💱 Пара: <b>{target}</b>\n"
+            f"💱 Пара: <b>{text}</b>\n"
             f"📈 Напрямок: <b>{res['direction']}</b>\n"
             f"⏳ Експірація: <b>{res['expiry']} хв</b>\n"
             f"🎯 Math Score: <b>{res['confidence']}%</b>\n"
@@ -449,16 +444,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📊 RSI: <code>{res['rsi']:.1f}</code> | POC: <code>{res['poc']:.5f}</code>\n"
         )
         keyboard = [
-            [InlineKeyboardButton("✅ Win", callback_data=f"win_{target}"), InlineKeyboardButton("❌ Loss", callback_data=f"loss_{target}")],
-            [InlineKeyboardButton("🔙 Меню", callback_data="back_menu")]
+            [InlineKeyboardButton("✅ Win", callback_data=f"win_{text}"), InlineKeyboardButton("❌ Loss", callback_data=f"loss_{text}")]
         ]
-        await query.message.delete()
-        await context.bot.send_photo(chat_id=query.message.chat_id, photo=chart_buf, caption=caption, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
-    elif data == "signal_all":
+        await context.bot.send_photo(chat_id=update.effective_chat.id, photo=chart_buf, caption=caption, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif text == "📊 Аналіз усіх пар":
         if not check_antiflood(user_id):
-            await query.answer(f"⏳ Зачекайте {COOLDOWN_TIME} секунд!", show_alert=True)
+            await update.message.reply_text(f"⏳ Зачекайте {COOLDOWN_TIME} секунд!")
             return
-        await query.edit_message_text(text="<b>⏳ Глибоке мульти-ТФ сканування ринку...</b>", parse_mode="HTML")
+        await update.message.reply_text("<b>⏳ Глибоке мульти-ТФ сканування ринку...</b>", parse_mode="HTML")
         
         results = []
         for p in PAIR_MAPPING.keys():
@@ -466,10 +460,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             results.append(r)
             await asyncio.sleep(0.3)
 
-        # Якщо бот повернув помилку не за розкладом на першій же парі
-        if results and not results[0]["status"] and "працює з 10:00 до 22:00" in results[0]["reason"]:
-            keyboard = [[InlineKeyboardButton("🔙 Меню", callback_data="back_menu")]]
-            await query.edit_message_text(text=f"⚠️ {results[0]['reason']}", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+        if results and not results[0]["status"] and "працює з 09:00 до 22:00" in results[0]["reason"]:
+            await update.message.reply_text(f"⚠️ {results[0]['reason']}")
             return
 
         res_text = "<b>📊 Звіт мультитаймфрейм сканування:</b>\n\n"
@@ -481,16 +473,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not found:
             res_text += "<i>Наразі немає активних сигналів із високою точністю.</i>"
             
-        keyboard = [[InlineKeyboardButton("🔙 Меню", callback_data="back_menu")]]
-        await query.edit_message_text(text=res_text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
-    elif data == "back_menu":
-        keyboard = []
-        pairs = list(PAIR_MAPPING.keys())
-        for i in range(0, len(pairs), 2):
-            keyboard.append([InlineKeyboardButton(pair, callback_data=f"sig_{pair}") for pair in pairs[i:i+2]])
-        keyboard.append([InlineKeyboardButton("📊 Аналіз усіх пар", callback_data="signal_all")])
-        keyboard.append([InlineKeyboardButton("📈 Статистика", callback_data="show_stats")])
-        await query.edit_message_text("Оберіть пару:", reply_markup=InlineKeyboardMarkup(keyboard))
+        await update.message.reply_text(res_text, parse_mode="HTML")
+
+    elif text == "📈 Статистика":
+        response_text = await get_statistics_text()
+        await update.message.reply_text(response_text, parse_mode="HTML")
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
+        return
+    data = query.data
+    if data.startswith("win_") or data.startswith("loss_"):
+        is_win = data.startswith("win_")
+        pair = data.split("_", 1)[1]
+        await update_outcome(pair, is_win)
+        await query.answer("Результат збережено!", show_alert=False)
+        return
 
 def background_market_scanner_sync(bot):
     if not NOTIFICATION_CHAT_ID:
@@ -554,6 +555,7 @@ def main():
     
     application = ApplicationBuilder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_error_handler(error_handler)
     
